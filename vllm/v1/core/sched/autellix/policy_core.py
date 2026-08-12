@@ -4,11 +4,14 @@
 
 Algorithm 1 of the paper runs the same per-call mechanics for every policy
 (MLFQ baseline, PLAS, ATLAS): each call holds a discretized priority level with
-a per-level decode-step quantum; exhausting the quantum demotes the call one
-level; a waiting call accrues wait, and once its wait-to-service ratio reaches
-``beta`` it is promoted back to the top level with its *call-level* windows
-reset; and when the batch is full a strictly-better waiting call proactively
-preempts the worst running call (bounded per step, recompute-based).
+a per-level quantum in **seconds of service** (D3); exhausting the quantum
+demotes the call one level; a waiting call accrues wait, and once its
+wait-to-service ratio reaches ``beta`` it is promoted back to the top level with
+its *call-level* windows reset; and when the batch is full a strictly-better
+waiting call proactively preempts the worst running call (bounded per step,
+recompute-based). Attained service is measured as engine wall time: each
+scheduled step charges its measured duration to every co-scheduled call,
+prefill chunks included (the paper's execution-time definition, ``e_i``).
 
 The policies differ only in the *windows* fed to the anti-starvation ratio:
 
@@ -37,7 +40,7 @@ release. It relies on base-scheduler attributes (``waiting``,
 """
 
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
@@ -49,21 +52,26 @@ from vllm.v1.request import Request
 class CallQueueState:
     """Mutable per-call queue bookkeeping, keyed by ``request_id``.
 
+    All windows are in **seconds of engine wall time** (D3): each scheduled
+    step charges its measured duration, so quanta and windows are robust to
+    variable step durations (long prefill steps, big batches, MPS interference)
+    and transfer across token lengths.
+
     Attributes:
         queue_index: The call's current queue; equals ``request.priority``
             (queue 0 is Q1, the highest priority).
-        quantum_remaining: Decode steps left before the call is demoted a
+        quantum_remaining: Seconds of service left before the call is demoted a
             level.
-        wait_window: Decode steps the call has waited (``W_c``); reset to 0 on
+        wait_window: Seconds the call has waited (``W_c``); reset to 0 on
             anti-starvation promotion.
-        service_window: Decode steps the call has been served (``T_c``); reset
-            to 0 on anti-starvation promotion.
+        service_window: Seconds the call has been served (``T_c``); reset to 0
+            on anti-starvation promotion.
     """
 
     queue_index: int
-    quantum_remaining: int
-    wait_window: int
-    service_window: int
+    quantum_remaining: float
+    wait_window: float
+    service_window: float
 
 
 class QuantumMlfqMixin:
@@ -85,7 +93,7 @@ class QuantumMlfqMixin:
     def _init_policy_core(
         self,
         num_queues: int,
-        queue_quanta: tuple[int, ...],
+        queue_quanta: tuple[float, ...],
         beta: float,
         max_proactive_preemptions_per_step: int,
         binner: MlfqBinner,
@@ -94,8 +102,8 @@ class QuantumMlfqMixin:
 
         Args:
             num_queues: Number of feedback queues ``K``.
-            queue_quanta: Per-queue decode-step quantum; must have length
-                ``num_queues``.
+            queue_quanta: Per-queue quantum in **seconds of service**; must have
+                length ``num_queues``.
             beta: Anti-starvation wait-to-service ratio threshold.
             max_proactive_preemptions_per_step: Upper bound on proactive
                 preemptions per ``schedule()`` call (0 disables it).
@@ -117,14 +125,26 @@ class QuantumMlfqMixin:
         self._call_state: dict[str, CallQueueState] = {}
         self.proactive_preemption_count = 0
 
+        # D1: one scheduler-side clock. ``schedule()`` is called once per engine
+        # step, so the interval between calls IS the batch step wall time when
+        # the engine is busy. ``_clock`` is injectable so tests can feed a
+        # deterministic step sequence; production uses ``time.monotonic``.
+        self._clock: Callable[[], float] = time.monotonic
+        self._last_step_ts: float | None = None
+        self._step_dt: float = 0.0
+        # Clamp guards idle gaps / pauses: an engine idle for seconds must not
+        # charge its first busy step a huge dt. Busy steps are tens of ms, well
+        # under the cap, so it only ever bounds the post-idle step.
+        self._max_step_dt: float = 1.0
+
     def _register_call_state(self, request: Request, queue_index: int) -> None:
         """Enter a new call at ``queue_index`` with that queue's full quantum."""
         request.priority = queue_index
         self._call_state[request.request_id] = CallQueueState(
             queue_index=queue_index,
             quantum_remaining=self.queue_quanta[queue_index],
-            wait_window=0,
-            service_window=0,
+            wait_window=0.0,
+            service_window=0.0,
         )
 
     def _program_windows(self, request: Request) -> tuple[float, float]:
@@ -136,8 +156,13 @@ class QuantumMlfqMixin:
         """
         return (0.0, 0.0)
 
-    def _on_service_step(self, req_id: str) -> None:
-        """Hook called once per charged decode step (default: no-op)."""
+    def _on_service_step(self, req_id: str, amount: float) -> None:
+        """Hook called once per charged step with its duration (default: no-op).
+
+        Args:
+            req_id: The scheduled request charged this step.
+            amount: Seconds of service charged (the measured step wall time).
+        """
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Run the policy bookkeeping, then delegate to the base loop.
@@ -156,7 +181,12 @@ class QuantumMlfqMixin:
         ("No free indices"). The worker frees slots before adding new/resumed
         requests, so reporting a victim resumed in this same step is safe.
         """
-        now = time.monotonic()
+        now = self._clock()
+        if self._last_step_ts is None:
+            self._step_dt = 0.0
+        else:
+            self._step_dt = min(max(now - self._last_step_ts, 0.0), self._max_step_dt)
+        self._last_step_ts = now
         self._accrue_wait_and_promote()
         preempted_req_ids = self._proactively_preempt(now)
         scheduler_output = super().schedule(throttle_prefills)  # type: ignore[misc]
@@ -171,10 +201,10 @@ class QuantumMlfqMixin:
         """Accrue wait for waiting calls and promote the starving ones to Q1.
 
         Every call currently waiting (in either the main or the skipped queue)
-        accrues one unit of wait ``W_c``. A call outside Q1 whose
-        ``(W_p + W_c) / max(1, T_p + T_c)`` has reached ``beta`` (program
-        windows from :meth:`_program_windows`) is promoted to Q1 with its
-        call-level windows reset, and the queue is re-heapified so the base
+        accrues this step's wall time as wait ``W_c`` (seconds, D3). A call
+        outside Q1 whose ``(W_p + W_c) / max(1, T_p + T_c)`` has reached ``beta``
+        (program windows from :meth:`_program_windows`) is promoted to Q1 with
+        its call-level windows reset, and the queue is re-heapified so the base
         loop sees the new ordering.
         """
         for queue in (self.waiting, self.skipped_waiting):
@@ -183,7 +213,7 @@ class QuantumMlfqMixin:
                 # Every queued call was registered by add_request, so its state
                 # is present; a missing entry is a real invariant violation.
                 state = self._call_state[request.request_id]
-                state.wait_window += 1
+                state.wait_window += self._step_dt
                 if state.queue_index == 0:
                     continue
                 program_wait, program_service = self._program_windows(request)
@@ -209,8 +239,8 @@ class QuantumMlfqMixin:
         """
         state.queue_index = 0
         state.quantum_remaining = self.queue_quanta[0]
-        state.wait_window = 0
-        state.service_window = 0
+        state.wait_window = 0.0
+        state.service_window = 0.0
         request.priority = 0
 
     def _proactively_preempt(self, now: float) -> set[str]:
@@ -249,28 +279,35 @@ class QuantumMlfqMixin:
         return preempted_req_ids
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Charge one decode step of quantum/service and demote on exhaustion.
+        """Charge this step's wall time to every scheduled call, demote on empty.
 
         ``super()`` (``AsyncScheduler`` -> ``Scheduler``) runs first to reserve
-        output placeholders and set ``is_prefill_chunk``. A running call whose
-        quantum is exhausted is then demoted one level and its priority updated
-        in place. Non-final prefill chunks are not charged, and the base async
-        over-schedule guard keeps the charge at one unit per output token under
-        run-ahead. Each charged step is also forwarded to
-        :meth:`_on_service_step` so program-aware hosts accrue attained service
-        in the same pass.
+        output placeholders. Then every request co-scheduled this step -- prefill
+        chunks **included** (D2), unlike the step-count version which skipped
+        them -- is charged the measured step duration ``self._step_dt`` (set in
+        :meth:`schedule`) against both its quantum and its service window. This
+        is execution-time accounting (the paper's ``e_i``): each co-scheduled
+        request pays the full step wall time, not a GPU share. A call whose
+        quantum is exhausted is demoted one level with its priority updated in
+        place. Each charge is forwarded to :meth:`_on_service_step` so
+        program-aware hosts accrue attained service in the same pass, keeping the
+        quantum and the program fold in lockstep. The first step after start /
+        idle has ``_step_dt == 0`` and charges nothing.
         """
         super()._update_after_schedule(scheduler_output)  # type: ignore[misc]
+        step_dt = self._step_dt
+        if step_dt <= 0.0:
+            return
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(req_id)
-            if request is None or request.is_prefill_chunk:
+            if request is None:
                 continue
             # A scheduled call is always registered (see add_request).
             state = self._call_state[req_id]
-            state.quantum_remaining -= 1
-            state.service_window += 1
-            self._on_service_step(req_id)
-            if state.quantum_remaining <= 0:
+            state.quantum_remaining -= step_dt
+            state.service_window += step_dt
+            self._on_service_step(req_id, step_dt)
+            if state.quantum_remaining <= 0.0:
                 state.queue_index = self.binner.demote(state.queue_index)
                 request.priority = state.queue_index
                 state.quantum_remaining = self.queue_quanta[state.queue_index]
